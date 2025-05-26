@@ -503,7 +503,7 @@ impl ClusterInfo {
                 }
                 let rpc_addr = node_rpc.ip();
                 Some(format!(
-                    "{:15} {:2}| {:5} | {:44} |{:^9}| {:5}| {:5}| {}\n",
+                    "{:15} {:2}| {:5} | {:44} |{:^9}| {:^9}| {:5}| {:5}| {}\n",
                     rpc_addr.to_string(),
                     if node.pubkey() == &my_pubkey {
                         "me"
@@ -512,8 +512,13 @@ impl ClusterInfo {
                     },
                     now.saturating_sub(last_updated),
                     node.pubkey().to_string(),
-                    if let Some(node_version) = node_version {
-                        node_version.to_string()
+                    if let Some(node_version) = &node_version {
+                       node_version.to_string()
+                    } else {
+                        "-".to_string()
+                    },
+                    if let Some(node_version) = &node_version {
+                        node_version.client().to_string()
                     } else {
                         "-".to_string()
                     },
@@ -526,7 +531,7 @@ impl ClusterInfo {
 
         format!(
             "RPC Address       |Age(ms)| Node identifier                              \
-             | Version | RPC  |PubSub|ShredVer\n\
+             | Version | Client | RPC  |PubSub|ShredVer\n\
              ------------------+-------+----------------------------------------------\
              +---------+------+------+--------\n\
              {}\
@@ -562,7 +567,7 @@ impl ClusterInfo {
                     }
                     let ip_addr = node.gossip().as_ref().map(SocketAddr::ip);
                     Some(format!(
-                        "{:15} {:2}| {:5} | {:44} |{:^9}| {:5}|  {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {}\n",
+                        "{:15} {:2}| {:5} | {:44} |{:^9}|{:^9}| {:5}|  {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {}\n",
                         node.gossip()
                             .filter(|addr| self.socket_addr_space.check(addr))
                             .as_ref()
@@ -573,8 +578,13 @@ impl ClusterInfo {
                         if node.pubkey() == &my_pubkey { "me" } else { "" },
                         now.saturating_sub(last_updated),
                         node.pubkey().to_string(),
-                        if let Some(node_version) = node_version {
+                        if let Some(node_version) = &node_version {
                             node_version.to_string()
+                        } else {
+                            "-".to_string()
+                        },
+                        if let Some(node_version) = &node_version {
+                            node_version.client().to_string()
                         } else {
                             "-".to_string()
                         },
@@ -593,7 +603,7 @@ impl ClusterInfo {
 
         format!(
             "IP Address        |Age(ms)| Node identifier                              \
-             | Version |Gossip|TPUvote| TPU  |TPUfwd| TVU  |TVU Q |ServeR|ShredVer\n\
+             | Version | Client |Gossip|TPUvote| TPU  |TPUfwd| TVU  |TVU Q |ServeR|ShredVer\n\
              ------------------+-------+----------------------------------------------\
              +---------+------+-------+------+------+------+------+------+--------\n\
              {}\
