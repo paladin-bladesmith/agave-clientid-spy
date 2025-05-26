@@ -82,6 +82,7 @@ use {
     std::{
         borrow::Borrow,
         collections::{HashMap, HashSet, VecDeque},
+        env,
         fmt::Debug,
         fs::{self, File},
         io::{BufReader, BufWriter, Write},
@@ -99,6 +100,9 @@ use {
         time::{Duration, Instant},
     },
     thiserror::Error,
+    reqwest,
+    serde_json::{json, Value},
+    tokio::runtime::Runtime
 };
 
 const DEFAULT_EPOCH_DURATION: Duration =
@@ -126,6 +130,9 @@ const MIN_NUM_STAKED_NODES: usize = 500;
 // The unsafes are safe because we're using fixed, known non-zero values
 pub const MINIMUM_NUM_TVU_SOCKETS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
 pub const DEFAULT_NUM_TVU_SOCKETS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(8) };
+
+use std::sync::OnceLock;
+static VALIDATOR_IDENTITIES: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
 
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum ClusterInfoError {
@@ -529,25 +536,23 @@ impl ClusterInfo {
             })
             .collect();
 
-        format!(
-            "RPC Address       |Age(ms)| Node identifier                              \
-             | Version | Client | RPC  |PubSub|ShredVer\n\
-             ------------------+-------+----------------------------------------------\
-             +---------+------+------+--------\n\
-             {}\
-             RPC Enabled Nodes: {}",
-            nodes.join(""),
-            nodes.len(),
-        )
+        format!("RPC enabled nodes: {}", nodes.len())
     }
 
     pub fn contact_info_trace(&self) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALL_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
         let now = timestamp();
         let mut shred_spy_nodes = 0usize;
         let mut total_spy_nodes = 0usize;
         let mut different_shred_nodes = 0usize;
         let my_pubkey = self.id();
         let my_shred_version = self.my_shred_version();
+        
+        // Collect validator data for both display and database
+        let mut validator_records = Vec::new();
+        
         let nodes: Vec<_> = self
             .all_peers()
             .into_iter()
@@ -556,7 +561,7 @@ impl ClusterInfo {
                 if is_spy_node {
                     total_spy_nodes = total_spy_nodes.saturating_add(1);
                 }
-
+    
                 let node_version = self.get_node_version(node.pubkey());
                 if my_shred_version != 0 && (node.shred_version() != 0 && node.shred_version() != my_shred_version) {
                     different_shred_nodes = different_shred_nodes.saturating_add(1);
@@ -566,6 +571,35 @@ impl ClusterInfo {
                         shred_spy_nodes = shred_spy_nodes.saturating_add(1);
                     }
                     let ip_addr = node.gossip().as_ref().map(SocketAddr::ip);
+                    
+                    // Extract port numbers for database
+                    let gossip_port = node.gossip().map(|addr| addr.port() as i32);
+                    let tpu_vote_port = node.tpu_vote(contact_info::Protocol::UDP).map(|addr| addr.port() as i32);
+                    let tpu_port = node.tpu(contact_info::Protocol::UDP).map(|addr| addr.port() as i32);
+                    let tpu_forwards_port = node.tpu_forwards(contact_info::Protocol::UDP).map(|addr| addr.port() as i32);
+                    let tvu_port = node.tvu(contact_info::Protocol::UDP).map(|addr| addr.port() as i32);
+                    let tvu_quic_port = node.tvu(contact_info::Protocol::QUIC).map(|addr| addr.port() as i32);
+                    let serve_repair_port = node.serve_repair(contact_info::Protocol::UDP).map(|addr| addr.port() as i32);
+                    
+                    // Prepare validator record for database
+                    let validator_record = json!({
+                        "pubkey": node.pubkey().to_string(),
+                        "ip_address": ip_addr.map(|ip| ip.to_string()),
+                        "last_seen_age_ms": now.saturating_sub(last_updated) as i64,
+                        "version": node_version.as_ref().map(|v| v.to_string()),
+                        "client": node_version.as_ref().map(|v| v.client().to_string()),
+                        "gossip_port": gossip_port,
+                        "tpu_vote_port": tpu_vote_port,
+                        "tpu_port": tpu_port,
+                        "tpu_forwards_port": tpu_forwards_port,
+                        "tvu_port": tvu_port,
+                        "tvu_quic_port": tvu_quic_port,
+                        "serve_repair_port": serve_repair_port,
+                        "shred_version": node.shred_version() as i32,
+                        "is_spy_node": is_spy_node
+                    });
+                    validator_records.push(validator_record);
+                    
                     Some(format!(
                         "{:15} {:2}| {:5} | {:44} |{:^9}|{:^9}| {:5}|  {:5}| {:5}| {:5}| {:5}| {:5}| {:5}| {}\n",
                         node.gossip()
@@ -600,27 +634,160 @@ impl ClusterInfo {
                 }
             })
             .collect();
+    
+        let counter = CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if counter % 20 == 0 && !validator_records.is_empty() {
+            self.update_supabase_validators(validator_records);
+        }
+        
+        format!("Contact info trace nodes: {}", nodes.len().saturating_sub(shred_spy_nodes))
+    }
 
-        format!(
-            "IP Address        |Age(ms)| Node identifier                              \
-             | Version | Client |Gossip|TPUvote| TPU  |TPUfwd| TVU  |TVU Q |ServeR|ShredVer\n\
-             ------------------+-------+----------------------------------------------\
-             +---------+------+-------+------+------+------+------+------+--------\n\
-             {}\
-             Nodes: {}{}{}",
-            nodes.join(""),
-            nodes.len().saturating_sub(shred_spy_nodes),
-            if total_spy_nodes > 0 {
-                format!("\nSpies: {total_spy_nodes}")
-            } else {
-                "".to_string()
-            },
-            if different_shred_nodes > 0 {
-                format!("\nNodes with different shred version: {different_shred_nodes}")
-            } else {
-                "".to_string()
+    async fn get_or_refresh_validator_identities(api_key: &str) -> Result<HashSet<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let validator_lock = VALIDATOR_IDENTITIES.get_or_init(|| {
+            println!("Initializing new validator identities cache");
+            RwLock::new(HashSet::new())
+        });
+        println!("Validator identities cache initialized: {}", VALIDATOR_IDENTITIES.get().is_some());
+        
+        // Try to read existing data first
+        {
+            let validators = validator_lock.read().unwrap();
+            if !validators.is_empty() {
+                log::info!("Returning existing validator list with {} validators", validators.len());
+                return Ok(validators.clone());
             }
-        )
+        }
+        
+        log::info!("Cache empty, fetching fresh validator data from API");
+        // If empty, fetch fresh data
+        let fresh_validators = ClusterInfo::fetch_validator_pubkeys(api_key).await?;
+        
+        // Convert HashMap to HashSet of validator identities
+        let validator_identities: HashSet<String> = fresh_validators.values().cloned().collect();
+        log::info!("Fetched {} new validators from API", validator_identities.len());
+        
+        // Update the static cache
+        {
+            let mut validators = validator_lock.write().unwrap();
+            *validators = validator_identities.clone();
+        }
+        
+        Ok(validator_identities)
+    }
+
+    async fn fetch_validator_pubkeys(api_key: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::new();
+        
+        let response = client
+            .get("https://www.validators.app/api/v1/validators/mainnet.json")
+            .header("Token", api_key)
+            .send()
+            .await?;
+        
+        #[derive(serde::Deserialize)]
+        struct ValidatorInfo {
+            account: String,
+            vote_account: String,
+        }
+        
+        let validators: Vec<ValidatorInfo> = response.json().await?;
+        
+        // Create mapping from vote_account -> account (validator identity)
+        let vote_to_identity: HashMap<String, String> = validators
+            .into_iter()
+            .map(|v| (v.vote_account, v.account))
+            .collect();
+        
+        Ok(vote_to_identity)
+    }
+
+    // Helper method to update Supabase
+    fn update_supabase_validators(&self, validator_records: Vec<Value>) {
+        // Get Supabase credentials from environment variables
+        let supabase_url = match env::var("SUPABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                log::warn!("SUPABASE_URL environment variable not set, skipping database update");
+                return;
+            }
+        };
+        
+        let supabase_key = match env::var("SUPABASE_SERVICE_KEY") {
+            Ok(key) => key,
+            Err(_) => {
+                log::warn!("SUPABASE_SERVICE_KEY environment variable not set, skipping database update");
+                return;
+            }
+        };
+
+        let validator_app_key = match env::var("VALIDATORS_APP_API_KEY") {
+            Ok(key) => key,
+            Err(_) => {
+                log::warn!("VALIDATORS_APP_API_KEY environment variable not set, skipping database update");
+                return;
+            }
+        };
+
+        // Spawn async task to update database
+        std::thread::spawn(move || {
+            let rt = Runtime::new().unwrap();
+            rt.block_on(async {
+                // Fetch current validator list (vote_account -> validator_identity mapping)
+                let vote_to_identity = match ClusterInfo::get_or_refresh_validator_identities(&validator_app_key).await {
+                    Ok(mapping) => mapping,
+                    Err(e) => {
+                        log::warn!("Failed to fetch validator list: {}, skipping Supabase update", e);
+                        return;
+                    }
+                };
+
+                let total_records = validator_records.len();
+
+                // Filter records and replace pubkey with validator identity account
+                let filtered_records: Vec<_> = validator_records
+                    .into_iter()
+                    .filter_map(|mut record| {
+                        if let Some(pubkey_str) = record.get("pubkey").and_then(|v| v.as_str()) {
+                            // Check if this vote account is in our validator list
+                            if let Some(validator_identity) = vote_to_identity.get(pubkey_str) {
+                                // Replace the pubkey (vote account) with the validator identity account
+                                record["pubkey"] = json!(validator_identity);
+                                return Some(record);
+                            }
+                        }
+                        None // Filter out if not a legitimate validator
+                    })
+                    .collect();
+
+                log::info!("Filtered {} records to {} legitimate validators", total_records, filtered_records.len());
+
+                let client = reqwest::Client::new();
+                
+                for record in filtered_records {
+                    let response = client
+                        .post(&format!("{}/rest/v1/validators", supabase_url))
+                        .header("apikey", &supabase_key)
+                        .header("Authorization", format!("Bearer {}", supabase_key))
+                        .header("Content-Type", "application/json")
+                        .header("Prefer", "resolution=merge-duplicates")
+                        .json(&record)
+                        .send()
+                        .await;
+
+                    match response {
+                        Ok(resp) => {
+                            if !resp.status().is_success() {
+                                log::warn!("Failed to update validator in Supabase: {}", resp.status());
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Error updating Supabase: {}", e);
+                        }
+                    }
+                }
+            });
+        });
     }
 
     // TODO: This has a race condition if called from more than one thread.
