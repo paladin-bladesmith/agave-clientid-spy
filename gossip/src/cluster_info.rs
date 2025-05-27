@@ -132,7 +132,7 @@ pub const MINIMUM_NUM_TVU_SOCKETS: NonZeroUsize = unsafe { NonZeroUsize::new_unc
 pub const DEFAULT_NUM_TVU_SOCKETS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(8) };
 
 use std::sync::OnceLock;
-static VALIDATOR_IDENTITIES: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+static VALIDATOR_IDENTITIES: OnceLock<RwLock<HashMap<String, (String, u64)>>> = OnceLock::new();
 
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum ClusterInfoError {
@@ -643,10 +643,10 @@ impl ClusterInfo {
         format!("Contact info trace nodes: {}", nodes.len().saturating_sub(shred_spy_nodes))
     }
 
-    async fn get_or_refresh_validator_identities(api_key: &str) -> Result<HashSet<String>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_or_refresh_validator_identities(api_key: &str) -> Result<HashMap<String, (String, u64)>, Box<dyn std::error::Error + Send + Sync>> {
         let validator_lock = VALIDATOR_IDENTITIES.get_or_init(|| {
             println!("Initializing new validator identities cache");
-            RwLock::new(HashSet::new())
+            RwLock::new(HashMap::new())
         });
         println!("Validator identities cache initialized: {}", VALIDATOR_IDENTITIES.get().is_some());
         
@@ -655,7 +655,7 @@ impl ClusterInfo {
             let validators = validator_lock.read().unwrap();
             if !validators.is_empty() {
                 log::info!("Returning existing validator list with {} validators", validators.len());
-                return Ok(validators.clone());
+                return Ok(validators.clone()); // Just return the cached HashMap directly
             }
         }
         
@@ -663,43 +663,42 @@ impl ClusterInfo {
         // If empty, fetch fresh data
         let fresh_validators = ClusterInfo::fetch_validator_pubkeys(api_key).await?;
         
-        // Convert HashMap to HashSet of validator identities
-        let validator_identities: HashSet<String> = fresh_validators.values().cloned().collect();
-        log::info!("Fetched {} new validators from API", validator_identities.len());
+        log::info!("Fetched {} new validators from API", fresh_validators.len());
         
         // Update the static cache
         {
             let mut validators = validator_lock.write().unwrap();
-            *validators = validator_identities.clone();
+            *validators = fresh_validators.clone(); // Store the full HashMap, not just identities
         }
         
-        Ok(validator_identities)
+        Ok(fresh_validators)
     }
 
-    async fn fetch_validator_pubkeys(api_key: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn fetch_validator_pubkeys(api_key: &str) -> Result<HashMap<String, (String, u64)>, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::new();
-        
+    
         let response = client
             .get("https://www.validators.app/api/v1/validators/mainnet.json")
             .header("Token", api_key)
             .send()
             .await?;
         
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, Debug, Clone)]
         struct ValidatorInfo {
             account: String,
             vote_account: String,
+            active_stake: Option<u64>,
         }
-        
+
         let validators: Vec<ValidatorInfo> = response.json().await?;
         
-        // Create mapping from vote_account -> account (validator identity)
-        let vote_to_identity: HashMap<String, String> = validators
+        // Create mapping from vote_account -> (account, active_stake)
+        let vote_to_data: HashMap<String, (String, u64)> = validators
             .into_iter()
-            .map(|v| (v.vote_account, v.account))
+            .map(|v| (v.account.clone(), (v.account, v.active_stake.unwrap_or(0))))
             .collect();
-        
-        Ok(vote_to_identity)
+
+        Ok(vote_to_data)
     }
 
     // Helper method to update Supabase
@@ -733,8 +732,8 @@ impl ClusterInfo {
         std::thread::spawn(move || {
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
-                // Fetch current validator list (vote_account -> validator_identity mapping)
-                let vote_to_identity = match ClusterInfo::get_or_refresh_validator_identities(&validator_app_key).await {
+                // Fetch current validator list (vote_account -> (validator_identity, active_stake) mapping)
+                let vote_to_data = match ClusterInfo::get_or_refresh_validator_identities(&validator_app_key).await {
                     Ok(mapping) => mapping,
                     Err(e) => {
                         log::warn!("Failed to fetch validator list: {}, skipping Supabase update", e);
@@ -744,15 +743,17 @@ impl ClusterInfo {
 
                 let total_records = validator_records.len();
 
-                // Filter records and replace pubkey with validator identity account
+                // Filter records and replace pubkey with validator identity account, add active_stake
                 let filtered_records: Vec<_> = validator_records
                     .into_iter()
                     .filter_map(|mut record| {
                         if let Some(pubkey_str) = record.get("pubkey").and_then(|v| v.as_str()) {
                             // Check if this vote account is in our validator list
-                            if let Some(validator_identity) = vote_to_identity.get(pubkey_str) {
+                            if let Some((validator_identity, active_stake)) = vote_to_data.get(pubkey_str) {
                                 // Replace the pubkey (vote account) with the validator identity account
                                 record["pubkey"] = json!(validator_identity);
+                                // Add active_stake to the record
+                                record["active_stake"] = json!(active_stake);
                                 return Some(record);
                             }
                         }
